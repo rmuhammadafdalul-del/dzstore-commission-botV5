@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS reviews(
 );
 `);
 
-// V7.5: customer sekarang boleh mempunyai beberapa ticket/order sekaligus.
+// V7.5 MULTI-TICKET: customer sekarang boleh mempunyai beberapa ticket/order sekaligus.
 // Hapus constraint lama yang membatasi 1 ticket aktif per user agar database
 // lama juga otomatis ikut mendukung multi-order.
 db.exec(`DROP INDEX IF EXISTS one_active_ticket_per_user;`);
