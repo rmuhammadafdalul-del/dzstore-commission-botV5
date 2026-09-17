@@ -1,6 +1,6 @@
 {
   "name": "dzs-commission-bot",
-  "version": "5.0.0",
+  "version": "7.5.0",
   "main": "src/index.js",
   "scripts": {"start": "node src/index.js"},
   "engines": {"node": ">=20"},
