@@ -1015,7 +1015,7 @@ client.on("interactionCreate", async interaction => {
         return openOrder(interaction, category, null);
       }
 
-      const ticketButtonMatch = interaction.customId.match(/^dzs_(claim|progress|waiting|completed|close)(?:_(DZS-\\d+))?$/i);
+      const ticketButtonMatch = interaction.customId.match(/^dzs_(claim|progress|waiting|completed|close)(?:_(DZS-\d+))?$/i);
       if (ticketButtonMatch) {
         if (!isStaff(interaction.member)) {
           return interaction.reply({
