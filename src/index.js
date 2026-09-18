@@ -230,29 +230,31 @@ function ticketEmbed(t) {
     .setFooter({ text: "DZS Commission System" });
 }
 
-function ticketControls() {
+function ticketControls(orderIdValue) {
+  // Simpan order ID di setiap tombol agar tombol selalu merujuk
+  // ke ticket yang benar, walaupun ada banyak ticket milik user yang sama.
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId("dzs_claim")
+        .setCustomId(`dzs_claim_${orderIdValue}`)
         .setLabel("👨‍💻 Claim")
         .setStyle(ButtonStyle.Primary),
       new ButtonBuilder()
-        .setCustomId("dzs_progress")
+        .setCustomId(`dzs_progress_${orderIdValue}`)
         .setLabel("🟡 Progress")
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
-        .setCustomId("dzs_waiting")
+        .setCustomId(`dzs_waiting_${orderIdValue}`)
         .setLabel("🟠 Waiting")
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
-        .setCustomId("dzs_completed")
+        .setCustomId(`dzs_completed_${orderIdValue}`)
         .setLabel("🟣 Completed")
         .setStyle(ButtonStyle.Success)
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId("dzs_close")
+        .setCustomId(`dzs_close_${orderIdValue}`)
         .setLabel("🔒 Close Ticket")
         .setStyle(ButtonStyle.Danger)
     )
@@ -508,10 +510,17 @@ async function createTicket(interaction, category, size) {
   const guild = interaction.guild;
   const staffRole = guild.roles.cache.get(process.env.STAFF_ROLE_ID);
 
-  const categoryChannel = guild.channels.cache.get(process.env.TICKET_CATEGORY_ID);
+  const categoryId = process.env.TICKET_CATEGORY_ID?.trim();
+  let categoryChannel = categoryId ? guild.channels.cache.get(categoryId) : null;
+  if (!categoryChannel && categoryId) {
+    categoryChannel = await guild.channels.fetch(categoryId).catch(() => null);
+  }
+
   if (!categoryChannel || categoryChannel.type !== ChannelType.GuildCategory) {
     return interaction.reply({
-      content: "❌ TICKET_CATEGORY_ID salah atau bukan Category Channel.",
+      content:
+        "❌ `TICKET_CATEGORY_ID` tidak menunjuk ke **Category Channel** yang bisa diakses bot.\n" +
+        "Pastikan Railway Variable berisi **ID kategori SHOPS**, bukan ID channel ticket.",
       ephemeral: true
     });
   }
@@ -567,7 +576,7 @@ async function createTicket(interaction, category, size) {
   await channel.send({
     content: `<@${interaction.user.id}> ${staffRole ? `<@&${staffRole.id}>` : ""}`,
     embeds: [ticketEmbed(t)],
-    components: ticketControls()
+    components: ticketControls(t.order_id)
   });
 
   // Semua notifikasi detail pembuatan order dirapikan ke LOG channel saja.
@@ -624,8 +633,34 @@ function categoryLabel(x) {
   return x.size ? `${x.category.toUpperCase()} ${x.size}` : x.category.toUpperCase();
 }
 
-async function claimTicket(interaction) {
-  const t = ticketByChannel(interaction.channelId);
+// Resolusi ticket terikat ke channel yang sedang ditekan.
+// Ini mencegah tombol dari ticket A mengubah ticket B.
+// Tombol versi lama (tanpa order ID) tetap didukung.
+function ticketForInteraction(interaction, suppliedOrderId = null) {
+  const byChannel = ticketByChannel(interaction.channelId);
+  if (byChannel) {
+    if (!suppliedOrderId || byChannel.order_id === suppliedOrderId) return byChannel;
+    return null;
+  }
+
+  if (suppliedOrderId) {
+    const byOrder = ticketByOrder(interaction.guildId, suppliedOrderId);
+    if (byOrder && byOrder.channel_id === interaction.channelId) return byOrder;
+  }
+
+  // Fallback untuk ticket yang dibuat versi lama: ambil DZS-xxxx dari topic.
+  const topic = interaction.channel?.topic || "";
+  const match = topic.match(/\b(DZS-\d{4,})\b/i);
+  if (match) {
+    const byTopic = ticketByOrder(interaction.guildId, match[1].toUpperCase());
+    if (byTopic && byTopic.channel_id === interaction.channelId) return byTopic;
+  }
+
+  return null;
+}
+
+async function claimTicket(interaction, suppliedOrderId = null) {
+  const t = ticketForInteraction(interaction, suppliedOrderId);
   if (!t) {
     return interaction.reply({ content: "❌ Ini bukan channel ticket.", ephemeral: true });
   }
@@ -662,8 +697,8 @@ async function claimTicket(interaction) {
   });
 }
 
-async function setStatus(interaction, status) {
-  const t = ticketByChannel(interaction.channelId);
+async function setStatus(interaction, status, suppliedOrderId = null) {
+  const t = ticketForInteraction(interaction, suppliedOrderId);
   if (!t) {
     return interaction.reply({ content: "❌ Ini bukan channel ticket.", ephemeral: true });
   }
@@ -687,8 +722,8 @@ async function setStatus(interaction, status) {
   });
 }
 
-async function closeTicket(interaction) {
-  const t = ticketByChannel(interaction.channelId);
+async function closeTicket(interaction, suppliedOrderId = null) {
+  const t = ticketForInteraction(interaction, suppliedOrderId);
   if (!t) {
     return interaction.reply({ content: "❌ Ini bukan channel ticket.", ephemeral: true });
   }
@@ -879,7 +914,8 @@ client.on("interactionCreate", async interaction => {
         return openOrder(interaction, category, null);
       }
 
-      if (["dzs_claim","dzs_progress","dzs_waiting","dzs_completed"].includes(interaction.customId)) {
+      const ticketButtonMatch = interaction.customId.match(/^dzs_(claim|progress|waiting|completed|close)(?:_(DZS-\\d+))?$/i);
+      if (ticketButtonMatch) {
         if (!isStaff(interaction.member)) {
           return interaction.reply({
             content: "❌ Khusus Admin / Commission Staff.",
@@ -887,19 +923,22 @@ client.on("interactionCreate", async interaction => {
           });
         }
 
-        if (interaction.customId === "dzs_claim") {
-          return claimTicket(interaction);
-        }
+        const action = ticketButtonMatch[1].toLowerCase();
+        const oid = ticketButtonMatch[2]?.toUpperCase() || null;
+
+        if (action === "claim") return claimTicket(interaction, oid);
+        if (action === "close") return closeTicket(interaction, oid);
 
         const map = {
-          dzs_progress: "progress",
-          dzs_waiting: "waiting",
-          dzs_completed: "completed"
+          progress: "progress",
+          waiting: "waiting",
+          completed: "completed"
         };
 
-        return setStatus(interaction, map[interaction.customId]);
+        return setStatus(interaction, map[action], oid);
       }
 
+      // Legacy close button
       if (interaction.customId === "dzs_close") {
         if (!isStaff(interaction.member)) {
           return interaction.reply({
@@ -914,7 +953,7 @@ client.on("interactionCreate", async interaction => {
         const p = interaction.customId.split("_");
         const oid = p[2];
         const rating = Number(p[3]);
-        const t = ticketByOrder(interaction.guildId, oid);
+        const t = ticketForInteraction(interaction, oid);
 
         if (!t || t.user_id !== interaction.user.id || t.status !== "completed") {
           return interaction.reply({
@@ -963,7 +1002,7 @@ client.on("interactionCreate", async interaction => {
         const p = interaction.customId.split("_");
         const oid = p[2];
         const rating = Number(p[3]);
-        const t = ticketByOrder(interaction.guildId, oid);
+        const t = ticketForInteraction(interaction, oid);
 
         if (!t || t.user_id !== interaction.user.id || t.status !== "completed") {
           return interaction.reply({
