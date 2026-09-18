@@ -26,3 +26,9 @@ STAFF_ROLE_ID=...
 ## Deploy
 Node 20+ dan `npm start`.
 Untuk SQLite, gunakan Railway Volume pada `/app/data` agar data order tidak hilang ketika container dibuat ulang.
+
+
+## V5.2.1 fixes
+- Fixed ticket button order-ID regex (prevents Discord "didn't respond in time").
+- Counter uses max stored sequence to avoid returning to DZS-0001 after DB counter loss.
+- Recovery fetches all guild channels under the configured ticket category.
