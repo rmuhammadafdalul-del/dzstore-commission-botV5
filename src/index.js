@@ -461,7 +461,103 @@ client.once("ready", async () => {
   } catch (err) {
     console.error("❌ GAGAL REGISTER COMMANDS:", err);
   }
+
+  await recoverTickets().catch(err => console.error("❌ TICKET RECOVERY ERROR:", err));
 });
+
+async function recoverTickets() {
+  // Railway SQLite is ephemeral unless /app/data is mounted as a Volume.
+  // To avoid old ticket channels becoming "not a ticket" after a redeploy,
+  // rebuild missing ticket rows from the existing Discord ticket channels.
+  const categoryId = process.env.TICKET_CATEGORY_ID?.trim();
+  if (!categoryId) return;
+  const guild = client.guilds.cache.first();
+  if (!guild) return;
+  const category = await guild.channels.fetch(categoryId).catch(() => null);
+  if (!category || category.type !== ChannelType.GuildCategory) return;
+
+  let maxSeq = 0;
+  for (const channel of category.children.cache.values()) {
+    if (channel.type !== ChannelType.GuildText) continue;
+    const m = channel.name.match(/^ticket-dzs-(\d{4,})$/i);
+    if (!m) continue;
+
+    const seq = Number(m[1]);
+    const oid = orderId(seq);
+    maxSeq = Math.max(maxSeq, seq);
+    if (ticketByChannel(channel.id)) continue;
+
+    const topic = channel.topic || "";
+    let customerId = null;
+    const overwrites = channel.permissionOverwrites?.cache;
+    if (overwrites) {
+      for (const ow of overwrites.values()) {
+        if (ow.id === guild.roles.everyone.id) continue;
+        if (ow.type === 1 && ow.allow.has(PermissionFlagsBits.ViewChannel.bitfield)) {
+          customerId = ow.id;
+          break;
+        }
+      }
+    }
+
+    let categoryName = "unknown";
+    let size = null;
+    const topicLabel = topic.match(/\|\s*([^|]+?)\s*\|/);
+    if (topicLabel) {
+      const label = topicLabel[1].trim();
+      const sm = label.match(/^(SKIN)\s+(64|128|256|512)$/i);
+      if (sm) {
+        categoryName = "skin";
+        size = sm[2];
+      } else {
+        categoryName = label.toLowerCase().replace(/\s+/g, "_");
+      }
+    }
+
+    // Try to recover customer/status/worker/request from the latest bot embed.
+    let status = "open";
+    let workerId = null;
+    let description = "Recovered from existing Discord ticket after bot redeploy.";
+    const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+    if (messages) {
+      for (const msg of messages.values()) {
+        const embed = msg.embeds?.[0];
+        if (!embed?.title || !embed.title.includes(oid)) continue;
+        const d = embed.description || "";
+        const cm = d.match(/\*\*Customer:\*\*\s*<@(\d+)>/);
+        const wm = d.match(/\*\*Worker:\*\*\s*<@(\d+)>/);
+        const sm = d.match(/\*\*Status:\*\*\s*(?:🟢|🟡|🟠|🟣)\s*(Open|Progress|Waiting|Completed)/i);
+        const rm = d.match(/\*\*Request \/ Detail:\*\*\s*([\s\S]*?)(?:\n\n|$)/);
+        if (cm) customerId = cm[1];
+        if (wm) workerId = wm[1];
+        if (sm) status = sm[1].toLowerCase();
+        if (rm) description = rm[1].trim();
+        break;
+      }
+    }
+
+    if (!customerId) continue;
+    const createdAt = new Date(channel.createdTimestamp || Date.now()).toISOString();
+    const closedAt = status === "completed" ? createdAt : null;
+    db.prepare(`
+      INSERT OR IGNORE INTO tickets(
+        guild_id,user_id,channel_id,seq,order_id,category,size,description,status,worker_id,created_at,closed_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(guild.id, customerId, channel.id, seq, oid, categoryName, size,
+      description, status, workerId, createdAt, closedAt);
+  }
+
+  // Never reuse an order number that already exists in Discord.
+  const counter = db.prepare("SELECT next_number FROM counters WHERE guild_id=?").get(guild.id);
+  const wantedNext = maxSeq + 1;
+  if (!counter || Number(counter.next_number) < wantedNext) {
+    db.prepare(`
+      INSERT INTO counters(guild_id,next_number) VALUES(?,?)
+      ON CONFLICT(guild_id) DO UPDATE SET next_number=excluded.next_number
+    `).run(guild.id, wantedNext);
+  }
+  console.log(`♻️ TICKET RECOVERY SELESAI. Nomor berikutnya: DZS-${String(Math.max(wantedNext, 1)).padStart(4, "0")}`);
+}
 
 async function cleanupCompletedTickets() {
   const cutoff = Date.now() - (24 * 60 * 60 * 1000);
@@ -502,6 +598,8 @@ async function openOrder(interaction, category, size) {
 }
 
 async function createTicket(interaction, category, size) {
+  // Acknowledge modal immediately so Discord never shows "didn't respond in time".
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true });
   // Customer boleh membuat beberapa ticket/order sekaligus.
 
   const description = interaction.fields.getTextInputValue("request");
@@ -517,11 +615,10 @@ async function createTicket(interaction, category, size) {
   }
 
   if (!categoryChannel || categoryChannel.type !== ChannelType.GuildCategory) {
-    return interaction.reply({
+    return interaction.editReply({
       content:
         "❌ `TICKET_CATEGORY_ID` tidak menunjuk ke **Category Channel** yang bisa diakses bot.\n" +
-        "Pastikan Railway Variable berisi **ID kategori SHOPS**, bukan ID channel ticket.",
-      ephemeral: true
+        "Pastikan Railway Variable berisi **ID kategori SHOPS**, bukan ID channel ticket."
     });
   }
 
@@ -623,9 +720,8 @@ async function createTicket(interaction, category, size) {
 
   // Discord tetap membutuhkan response untuk modal submit, tetapi detail
   // pembuatan ticket tidak dikirim sebagai notifikasi tambahan.
-  return interaction.reply({
-    content: "✅ Order berhasil diproses. Ticket sudah disiapkan. Kamu tetap bisa membuat order/ticket lainnya.",
-    ephemeral: true
+  return interaction.editReply({
+    content: "✅ Order berhasil diproses. Ticket sudah disiapkan. Kamu tetap bisa membuat order/ticket lainnya."
   });
 }
 
@@ -637,25 +733,26 @@ function categoryLabel(x) {
 // Ini mencegah tombol dari ticket A mengubah ticket B.
 // Tombol versi lama (tanpa order ID) tetap didukung.
 function ticketForInteraction(interaction, suppliedOrderId = null) {
+  // Primary key: channel_id. This is the safest way to isolate multi-ticket orders.
   const byChannel = ticketByChannel(interaction.channelId);
   if (byChannel) {
     if (!suppliedOrderId || byChannel.order_id === suppliedOrderId) return byChannel;
     return null;
   }
 
-  if (suppliedOrderId) {
-    const byOrder = ticketByOrder(interaction.guildId, suppliedOrderId);
+  // Recovery fallback: if SQLite was recreated, use the DZS order ID in the
+  // channel name/topic. recoverTickets() normally restores the row at startup.
+  const topic = interaction.channel?.topic || "";
+  const nameMatch = (interaction.channel?.name || "").match(/ticket-dzs-(\d{4,})/i);
+  const topicMatch = topic.match(/\b(DZS-\d{4,})\b/i);
+  const recoveredOrder = suppliedOrderId ||
+    (nameMatch ? `DZS-${nameMatch[1]}` : null) ||
+    (topicMatch ? topicMatch[1].toUpperCase() : null);
+
+  if (recoveredOrder) {
+    const byOrder = ticketByOrder(interaction.guildId, recoveredOrder);
     if (byOrder && byOrder.channel_id === interaction.channelId) return byOrder;
   }
-
-  // Fallback untuk ticket yang dibuat versi lama: ambil DZS-xxxx dari topic.
-  const topic = interaction.channel?.topic || "";
-  const match = topic.match(/\b(DZS-\d{4,})\b/i);
-  if (match) {
-    const byTopic = ticketByOrder(interaction.guildId, match[1].toUpperCase());
-    if (byTopic && byTopic.channel_id === interaction.channelId) return byTopic;
-  }
-
   return null;
 }
 
@@ -687,14 +784,16 @@ async function claimTicket(interaction, suppliedOrderId = null) {
   db.prepare("UPDATE tickets SET worker_id=?, status=? WHERE channel_id=?")
     .run(interaction.user.id, "progress", interaction.channelId);
 
-  await interaction.channel.send({
-    embeds: [ticketEmbed(ticketByChannel(interaction.channelId))]
-  });
-
-  return interaction.reply({
+  await interaction.reply({
     content: `✅ Ticket **${t.order_id}** berhasil di-claim oleh <@${interaction.user.id}> dan otomatis masuk **Progress**.`,
     ephemeral: true
   });
+
+  await interaction.channel.send({
+    embeds: [ticketEmbed(ticketByChannel(interaction.channelId))]
+  }).catch(() => {});
+
+  return;
 }
 
 async function setStatus(interaction, status, suppliedOrderId = null) {
@@ -712,14 +811,16 @@ async function setStatus(interaction, status, suppliedOrderId = null) {
   db.prepare("UPDATE tickets SET status=? WHERE channel_id=?")
     .run(status, interaction.channelId);
 
-  await interaction.channel.send({
-    embeds: [ticketEmbed(ticketByChannel(interaction.channelId))]
-  });
-
-  return interaction.reply({
+  await interaction.reply({
     content: `✅ ${t.order_id} → **${status}**`,
     ephemeral: true
   });
+
+  await interaction.channel.send({
+    embeds: [ticketEmbed(ticketByChannel(interaction.channelId))]
+  }).catch(() => {});
+
+  return;
 }
 
 async function closeTicket(interaction, suppliedOrderId = null) {
@@ -750,6 +851,11 @@ async function closeTicket(interaction, suppliedOrderId = null) {
 
   const updated = ticketByChannel(interaction.channelId);
 
+  await interaction.reply({
+    content: `✅ ${updated.order_id} selesai. Silakan isi feedback. Setelah feedback dikirim, ticket akan dihapus dalam **15 detik**.`,
+    ephemeral: true
+  });
+
   await interaction.channel.send({
     embeds: [
       new EmbedBuilder()
@@ -760,12 +866,7 @@ async function closeTicket(interaction, suppliedOrderId = null) {
         )
     ],
     components: [ratingButtons(updated.order_id)]
-  });
-
-  await interaction.reply({
-    content: `✅ ${updated.order_id} selesai. Silakan isi feedback. Setelah feedback dikirim, ticket akan dihapus dalam **15 detik**.`,
-    ephemeral: true
-  });
+  }).catch(() => {});
 }
 
 async function getWorkerProfile(guild, workerId) {
